@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pybullet_robokit"
+version = "0.0.1"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Marcus Rosette", email = "rosettem@oregonstate.edu" },
+]
+maintainers = [
+    { name = "Marcus Rosette", email = "rosettem@oregonstate.edu" },
+]
+description = "Pybullet base-class to facilitate environment setup and robot arm control"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "pybullet",
+    "pybullet_planning",
+    "matplotlib",
+    "scipy",
+    "opencv-python",
+    "open3d",
+    "spatialmath-python",
+]
