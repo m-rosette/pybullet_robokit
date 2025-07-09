@@ -216,7 +216,7 @@ class KinematicChainMotionPlanner:
 
             # ✅ Joint update
             q_new = q + alpha * dq_filtered
-            self.robot.set_joint_configuration(q_new.tolist())
+            self.robot.reset_joint_positions(q_new.tolist())
 
             # Text
             self.robot.con.addUserDebugText(f"Manipulability: {manipulability:.4f}", [0.4, 0, 0], [0.5, 0.0, 0.8], 1.5, 0.1)
