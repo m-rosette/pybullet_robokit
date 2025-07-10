@@ -295,7 +295,7 @@ class LoadRobot:
     def set_joint_path(self, joint_path, delay=0.01):
         # Vizualize the interpolated positions
         for config in joint_path:
-            self.set_joint_configuration(config)
+            self.reset_joint_positions(config)
             time.sleep(delay)  # Add a small delay for visualization purposes
 
     def get_joint_positions(self):
