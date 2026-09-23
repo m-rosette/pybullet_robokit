@@ -21,7 +21,5 @@ dependencies = [
     "pybullet_planning",
     "matplotlib",
     "scipy",
-    "opencv-python",
     "open3d",
-    "spatialmath-python",
 ]

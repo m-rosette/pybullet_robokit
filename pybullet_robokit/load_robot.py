@@ -306,7 +306,12 @@ class LoadRobot:
         link_position = np.array(link_state[0])
         link_orientation = np.array(link_state[1])
         return link_position, link_orientation
-    
+
+    def get_ee_pose(self, joint_config):
+        """ Resets to `joint_config` and returns the end-effector (position, orientation). """
+        self.reset_joint_positions(joint_config)
+        return self.get_link_state(self.end_effector_index)
+
     def check_self_collision(self, joint_config):
         # Set the joint state and step the simulation
         self.reset_joint_positions(joint_config)
@@ -330,7 +335,7 @@ class LoadRobot:
 
         return False
     
-    def collision_check(self, id_a, collision_objects=[]):
+    def collision_check(self, id_a, collision_objects=None):
         if not collision_objects:
             collision_objects = self.collision_objects
 
@@ -340,14 +345,40 @@ class LoadRobot:
             if len(collision) > 0:
                 return True
         return False
-    
-    def inverse_kinematics(self, pose, pos_tol=1e-4, rest_config=None, max_iter=100, resample=1, num_resample=5):
+
+    def in_collision(self, joint_config, collision_objects=None):
+        """ Resets to `joint_config` and returns True if it is in self- or environment-collision.
+        `collision_objects` defaults to the robot's configured collision_objects.
+        """
+        if self.check_self_collision(joint_config):
+            return True
+        return self.collision_check(self.robotId, collision_objects)
+
+    def inverse_kinematics(self, pose, pos_tol=1e-4, rest_config=None, max_iter=100, num_resample=5,
+                            collision_objects=None, perturb_scale=0.05, return_status=False):
+        """ Solves IK, retrying with a perturbed rest configuration whenever the solution is in
+        self-collision (and, if `collision_objects` is given, environment-collision too).
+
+        Args:
+            pose: (position, orientation) tuple, or position alone for a position-only solve.
+            num_resample (int, optional): number of retry attempts (with a perturbed rest
+                configuration) after the first IK solve, if that solve is in collision. Set to 0
+                to disable retries entirely (a single IK attempt). Defaults to 5.
+            collision_objects (list, optional): body IDs to also check the solution against.
+                Defaults to None, meaning only self-collision is checked (the original behavior).
+            perturb_scale (float, optional): magnitude (rad) of the random rest-config perturbation
+                applied between retries. Defaults to 0.05.
+            return_status (bool, optional): if True, also return whether the returned solution is
+                collision-free, using the check already performed internally (avoids having the
+                caller re-check collision on the result). Defaults to False (original behavior:
+                returns joint_positions alone).
+        """
         # Set the rest configuration to home if not provided
         rest_config = rest_config or self.home_config
 
         # Check if the pose is a list of length 2 or 3 (position or position + orientation)
         position, orientation = pose if len(pose) == 2 else (pose, None)
-        
+
         # Stage IK arguments
         kwargs = {
             "lowerLimits": self.lower_limits,
@@ -357,8 +388,8 @@ class LoadRobot:
             "residualThreshold": pos_tol,
             "maxNumIterations": max_iter
         }
-    
-        for _ in range(num_resample):
+
+        for attempt in range(num_resample + 1):
             if orientation is not None:
                 joint_positions = self.con.calculateInverseKinematics(self.robotId, self.end_effector_index, position, orientation, **kwargs)
             else:
@@ -366,17 +397,22 @@ class LoadRobot:
 
             if joint_positions is None:
                 continue
-            
-            # Check for self-collision
-            self.reset_joint_positions(joint_positions)
-            if not self.check_self_collision(joint_positions):
-                return joint_positions
+
+            # check_self_collision resets the robot to joint_positions as part of the check,
+            # so the environment check below reads contacts for that same state.
+            in_self_collision = self.check_self_collision(joint_positions)
+            in_env_collision = collision_objects is not None and self.collision_check(self.robotId, collision_objects)
+            if not in_self_collision and not in_env_collision:
+                return (joint_positions, True) if return_status else joint_positions
+
+            if attempt == num_resample:
+                break  # out of retries
 
             # Adjust rest configuration slightly to explore new solutions
             # Modify the rest configuration slightly instead of random sampling
-            rest_config = np.clip(np.array(rest_config) + np.random.uniform(-0.05, 0.05, len(rest_config)),
+            rest_config = np.clip(np.array(rest_config) + np.random.uniform(-perturb_scale, perturb_scale, len(rest_config)),
                                 self.lower_limits, self.upper_limits).tolist()
-        return joint_positions
+        return (joint_positions, False) if return_status else joint_positions
     
     def inverse_dynamics(self, joint_positions, joint_velocities=None, joint_accelerations=None):
         joint_velocities = joint_velocities or [0.0] * len(joint_positions)

@@ -95,7 +95,7 @@ def rectangular_prism_geometry(height, width, depth):
         depth (float): depth (z-axis)
 
     Returns:
-        opne3d geometry: mesh of rectangular prism
+        open3d geometry: mesh of rectangular prism
     """
     prism = o3d.geometry.TriangleMesh.create_box(width=width, height=height, depth=depth)
     prism.translate(-prism.get_center())
@@ -111,7 +111,7 @@ def parallelepiped_geometry(height, width, depth, theta):
         theta (float): skew angle of prism (yz-plane)
 
     Returns:
-        opne3d geometry: mesh of parallelepiped
+        open3d geometry: mesh of parallelepiped
     """
     # Define the rotation matrix around the x-axis
     R_x = R.from_euler('x', theta).as_matrix()
@@ -168,21 +168,22 @@ def voxelize_shape(geometry, voxel_size, vis=False, pyb_tranform=True):
     Returns:
         float lists: voxel center coordinates and their indices
     """
-    geometry_type = type(geometry)
-
     # Voxelize the geometry with a specified voxel size
-    if geometry_type == o3d.geometry.TriangleMesh:    
+    if isinstance(geometry, o3d.geometry.TriangleMesh):
         voxel_grid = o3d.geometry.VoxelGrid.create_from_triangle_mesh(geometry, voxel_size=voxel_size)
-
-    if geometry_type == o3d.geometry.PointCloud:
+    elif isinstance(geometry, o3d.geometry.PointCloud):
         voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(geometry, voxel_size=voxel_size)
+    else:
+        raise TypeError(f"Unsupported geometry type for voxelization: {type(geometry)}")
 
     # Get the voxel data
     voxels = voxel_grid.get_voxels()
-    
+    if not voxels:
+        raise ValueError("Voxelization produced no voxels - check voxel_size against the geometry's extent.")
+
     # Extract voxel centers and their indices
     voxel_centers, voxel_indices = zip(*[(voxel_grid.get_voxel_center_coordinate(voxel.grid_index), voxel.grid_index) for voxel in voxels])
-    
+
     if vis:
         # Create a coordinate frame 
         coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
@@ -193,13 +194,9 @@ def voxelize_shape(geometry, voxel_size, vis=False, pyb_tranform=True):
     if pyb_tranform:
         # Transform voxel data from open3d coordinate frame to pybullet coordinate frame
         R_x = R.from_euler('x', np.pi/2).as_matrix()
-        rotated_voxel = np.dot(voxel_centers, R_x.T)
-        voxel_centers = rotated_voxel
+        voxel_centers = np.dot(voxel_centers, R_x.T)
 
-        y_trans = min(voxel_centers[:, 1])
-        z_trans = min(voxel_centers[:, 2])
-
-        # translation = np.array([0, np.abs(y_trans), np.abs(z_trans)])
+        z_trans = voxel_centers[:, 2].min()
         translation = np.array([0, 0, np.abs(z_trans)])
         voxel_centers += translation
 
@@ -230,23 +227,28 @@ def generate_parallelepiped_voxels(height, width, depth, theta, voxel_size, pyb_
     xv, yv, zv = np.meshgrid(x, y, z, indexing='ij')
     voxel_coords = np.vstack([xv.ravel(), yv.ravel(), zv.ravel()]).T
 
-    # Filter voxels inside the parallelepiped
-    inside_voxels = np.array([coord for coord in voxel_coords if is_point_in_parallelepiped(coord, vertices)])
+    # Filter voxels inside the parallelepiped. Build the hull once and test every grid point
+    # against it in one vectorized pass, rather than rebuilding the hull per point.
+    hull = ConvexHull(vertices)
+    inside_voxels = voxel_coords[_points_in_hull(voxel_coords, hull)]
 
     if pyb_trans:
-        inside_voxels[:, 0] -= max(inside_voxels[:, 0]) / 2
+        inside_voxels[:, 0] -= inside_voxels[:, 0].max() / 2
         inside_voxels[:, 1] *= -1
-        inside_voxels[:, 1] -= min(inside_voxels[:, 1]) / 2
+        inside_voxels[:, 1] -= inside_voxels[:, 1].min() / 2
 
     return inside_voxels
 
+def _points_in_hull(points, hull):
+    """ Vectorized check for which rows of `points` (N,3) lie inside a convex hull. """
+    normals = hull.equations[:, :-1]
+    offsets = hull.equations[:, -1]
+    return np.all(points @ normals.T <= -offsets, axis=1)
+
 def is_point_in_parallelepiped(point, vertices):
-    """ Check if a point is inside the parallelepiped defined by its vertices """
-    # Create a convex hull from the vertices
+    """ Check if a single point is inside the parallelepiped defined by its vertices """
     hull = ConvexHull(vertices)
-    # Check if the point is inside the convex hull
-    new_point = np.append(point, 1)  # Append 1 for homogeneous coordinates
-    return np.all(np.dot(hull.equations[:, :-1], new_point[:-1]) <= -hull.equations[:, -1])
+    return bool(_points_in_hull(np.asarray(point).reshape(1, 3), hull)[0])
 
 
 if __name__ == '__main__':
