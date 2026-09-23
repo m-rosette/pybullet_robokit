@@ -1,7 +1,5 @@
 import atexit
 import os
-import sys
-import ctypes
 import pybullet as p
 import pybullet_data
 from pybullet_utils import bullet_client as bc
@@ -12,7 +10,6 @@ class PybUtils:
         """ Base class for the PyBullet Client
 
         Args:
-            env (class): initialized class that starts this base class
             renders (bool, optional): visualize the env with the PyBullet GUI. Defaults to False.
         """
         self.renders = renders
@@ -28,16 +25,8 @@ class PybUtils:
             self.con = bc.BulletClient(connection_mode=p.GUI)
             self.con.configureDebugVisualizer(self.con.COV_ENABLE_GUI, 0)
         else:
-            # Suppress stdout and stderr at the OS level
-            # libc = ctypes.CDLL(None)
-            if sys.platform.startswith('linux'):
-                libc = ctypes.CDLL("libc.so.6")
-            elif sys.platform == "darwin":
-                libc = ctypes.CDLL("libc.dylib")
-            elif sys.platform == "win32":
-                libc = ctypes.CDLL("msvcrt.dll")  # Microsoft C runtime
-            else:
-                raise RuntimeError("Unsupported OS")
+            # Suppress stdout and stderr at the OS level (os.dup2/os.devnull are portable,
+            # so no platform-specific handling is needed here)
             original_stdout = os.dup(1)  # Duplicate stdout file descriptor
             original_stderr = os.dup(2)  # Duplicate stderr file descriptor
 

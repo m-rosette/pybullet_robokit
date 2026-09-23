@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from scipy.spatial.transform import Slerp
 from scipy.spatial.transform import Rotation as R
 import pybullet_planning as pp
-from pybullet_planning import (rrt_connect, get_distance_fn, get_sample_fn, get_extend_fn, get_collision_fn)
+from pybullet_planning import (rrt_connect, get_distance_fn, get_sample_fn, get_extend_fn, get_collision_fn, smooth_path)
 from pybullet_planning import cartesian_motion_planning
 
 
@@ -93,7 +93,7 @@ class KinematicChainMotionPlanner:
 
         return adjusted_end_configuration
 
-    def interpolate_joint_trajectory(self, start_config, end_config, num_steps):
+    def interpolate_joint_trajectory(self, start_config, end_config, num_steps, collision_objects=None):
         """
         Interpolates a joint joint trajectory from start_config to end_config
 
@@ -101,6 +101,9 @@ class KinematicChainMotionPlanner:
         - start_config: numpy array of shape (n,), start joint positions
         - end_config: numpy array of shape (n,), end joint positions
         - num_steps: int, number of interpolation steps
+        - collision_objects: optional list of body IDs to also check each waypoint against.
+          Defaults to None, meaning only self-collision is checked (the original behavior) -
+          pass this to check environment collision in the same pass instead of a separate loop.
 
         Returns:
         - interpolated_configs: numpy array of shape (num_steps, n), interpolated joint positions
@@ -127,11 +130,16 @@ class KinematicChainMotionPlanner:
                 # Store the interpolated value in the array
                 interpolated_configs[i, j] = interpolated_value
 
-        # Check for collisions in the interpolated path
-        collision_in_path = any(self.robot.check_self_collision(config) for config in interpolated_configs)
+        # Check for collisions in the interpolated path (self-collision always; environment
+        # collision too, in the same pass, if collision_objects is given)
+        collision_in_path = any(
+            self.robot.check_self_collision(config) or
+            (collision_objects is not None and self.robot.collision_check(self.robot.robotId, collision_objects))
+            for config in interpolated_configs
+        )
 
         return interpolated_configs, collision_in_path
-    
+
     def resolved_rate_control(self, target_pose, alpha=0.75, max_steps=10000, tol=0.05,
                             manipulability_gain=0.1, damping_lambda=0.15, beta=0.9, max_joint_vel=1.0,
                             stall_patience=10, stall_vel_threshold=0.1, plot_manipulability=False):
@@ -308,221 +316,142 @@ class KinematicChainMotionPlanner:
 
         return interpolated_configs, collision_in_path
 
-    def peck_traj_gen(self, start_config, start_pose, end_config, end_pose, num_steps):
-        """ Interpolates a joint trajectory between a start and end joint configuration, but also has the end effectory pass through a point that 
-        is between the start and end effector position and orientation, while keeping the depth (y) at the same position as the start position.
+    def _two_stage_waypoints(self, start_position, end_position, num_steps):
+        """ Yields (i, position) pairs for a two-stage world X/Z-then-Y sweep between two
+        end-effector positions: stage 1 moves X/Z with Y held at `start_position`'s value,
+        stage 2 moves Y with X/Z held at `end_position`'s value. i runs from 1 to num_steps - 2
+        inclusive; the caller owns waypoints 0 (start) and num_steps - 1 (forced to the end).
+        """
+        num_steps_stage1 = max(2, num_steps // 2)
+        num_steps_stage2 = num_steps - num_steps_stage1
+
+        x_wp = np.linspace(start_position[0], end_position[0], num_steps_stage1)
+        z_wp = np.linspace(start_position[2], end_position[2], num_steps_stage1)
+        for i in range(1, num_steps_stage1):
+            yield i, np.array([x_wp[i], start_position[1], z_wp[i]])
+
+        y_wp = np.linspace(start_position[1], end_position[1], num_steps_stage2)
+        for j in range(1, num_steps_stage2):
+            yield num_steps_stage1 - 1 + j, np.array([end_position[0], y_wp[j], end_position[2]])
+
+    def two_stage_cartesian_path(self, start_config, end_config, num_steps=100,
+                                  collision_objects=None, pos_tol=1e-3, ik_max_iter=200):
+        """ Plans a two-stage Cartesian path between two joint configurations.
+
+        Stage 1 sweeps the end-effector through the world X/Z plane (depth and height)
+        while holding world-Y fixed at its starting value. Stage 2 then sweeps world-Y
+        (reaching out to the side) while holding X/Z fixed at the values reached at the
+        end of stage 1. End-effector orientation is slerped continuously across both stages.
 
         Args:
-            start_config (np.array): starting joint coinfiguration
-            start_pose (np.array): starting end effector pose [x, y, z, rz, ry, rz, w]
-            end_config (np.array): ending joint coinfiguration
-            end_pose (np.array): ending end effector pose [x, y, z, rz, ry, rz, w]
-            num_steps (int): number of joint configurations in trajectory
+            start_config (array-like): starting joint configuration
+            end_config (array-like): target joint configuration
+            num_steps (int, optional): total number of waypoints across both stages. Defaults to 100.
+            collision_objects (list, optional): body IDs to check the path against.
+                Defaults to the robot's configured collision_objects.
+            pos_tol (float, optional): IK position tolerance. Defaults to 1e-3.
+            ik_max_iter (int, optional): max IK iterations per waypoint. Defaults to 200.
 
         Returns:
-            traj (np.array): joint trajectory
-            collision (bool): describes any collisions in the trajectory
+            joint_path (np.ndarray): (num_steps, n) array of joint configurations.
+            collision_in_path (bool): True if any waypoint is in self- or environment-collision.
         """
-        start_position = start_pose[:3]
-        start_orientation = start_pose[3:]
+        start_config = np.array(start_config, dtype=float)
+        end_config = np.array(end_config, dtype=float)
 
-        end_position = end_pose[:3]
-        end_orientation = end_pose[3:]
+        start_position, start_orientation = self.robot.get_ee_pose(start_config)
+        end_position, end_orientation = self.robot.get_ee_pose(end_config)
+        self.robot.reset_joint_positions(start_config)
 
-        mid_position = np.copy(end_position)
-        mid_position[1] = start_position[1]
+        slerp = Slerp([0, 1], R.from_quat([start_orientation, end_orientation]))
 
-        rotations = R.from_quat([start_orientation, end_orientation])
+        joint_path = np.zeros((num_steps, len(start_config)))
+        joint_path[0] = start_config
+        prev_config = start_config
 
-        # Define key times (e.g., t=0 for start, t=1 for end)
-        times = np.array([0, 1])
+        for i, position in self._two_stage_waypoints(start_position, end_position, num_steps):
+            orientation = slerp(i / (num_steps - 1)).as_quat()
+            joint_config = self.robot.inverse_kinematics((position, orientation), pos_tol=pos_tol,
+                                                           rest_config=list(prev_config), max_iter=ik_max_iter)
+            joint_config = self.shortest_angular_distance(prev_config, joint_config)
+            joint_path[i] = joint_config
+            prev_config = joint_config
 
-        # Create SLERP object with two rotations
-        slerp = Slerp(times, rotations)
+        # Force the final waypoint to match the requested end configuration exactly
+        joint_path[-1] = self.shortest_angular_distance(joint_path[-2], end_config)
 
-        # Interpolate at t = 0.5 (midpoint)
-        mid_rotation = slerp(0.5)
+        collision_in_path = any(self.robot.in_collision(config, collision_objects) for config in joint_path)
 
-        # Get the quaternion for the mid rotation
-        mid_orientation = mid_rotation.as_quat()
+        return joint_path, collision_in_path
 
-        test_rest_ee_pos = (start_position + mid_position) / 2 
-        test_rest_config = self.robot.inverse_kinematics(test_rest_ee_pos, mid_orientation, rest_config=list(start_config))
-        test_rest_config[4:] = self.shortest_angular_distance(start_config[4:], end_config[4:])
-
-        mid_config = self.robot.inverse_kinematics(mid_position, mid_orientation, rest_config=list(test_rest_config))
-
-        first_half_traj, path_collision1 = self.interpolate_joint_trajectory(start_config, mid_config, int(num_steps/2))
-        second_half_traj, path_collision2 = self.interpolate_joint_trajectory(first_half_traj[-1], end_config, int(num_steps/2))
-
-        traj = np.vstack((first_half_traj, second_half_traj))
-
-        if path_collision1 or path_collision2:
-            collision = True
-        else:
-            collision = False
-
-        return traj, collision
-    
-    def peck_traj_gen2(self, start_config, start_pose, end_config, end_pose, num_steps):
-        """ Interpolates a joint trajectory between a start and end joint configuration, but also has the end effectory pass through multiple points 
-        that are between the start and end effector position and orientation, while keeping the depth (y) at the same position as the start position.
+    def two_stage_cartesian_path_avoid_collisions(self, start_config, end_config, num_steps=100,
+                                                   collision_objects=None, pos_tol=1e-3, ik_max_iter=200,
+                                                   max_retries=10, perturb_scale=0.1, stop_on_collision=True):
+        """ Same staging as `two_stage_cartesian_path` (world X/Z, then world Y), but with
+        collision avoidance built into the planner: each waypoint's IK solve is retried,
+        perturbing the rest configuration, until it finds a self- and environment-collision-free
+        solution or `max_retries` is exhausted.
 
         Args:
-            start_config (np.array): starting joint coinfiguration
-            start_pose (np.array): starting end effector pose [x, y, z, rz, ry, rz, w]
-            end_config (np.array): ending joint coinfiguration
-            end_pose (np.array): ending end effector pose [x, y, z, rz, ry, rz, w]
-            num_steps (int): number of joint configurations in trajectory
+            start_config (array-like): starting joint configuration
+            end_config (array-like): target joint configuration
+            num_steps (int, optional): total number of waypoints across both stages. Defaults to 100.
+            collision_objects (list, optional): body IDs to check each waypoint against.
+                Defaults to the robot's configured collision_objects.
+            pos_tol (float, optional): IK position tolerance. Defaults to 1e-3.
+            ik_max_iter (int, optional): max IK iterations per waypoint. Defaults to 200.
+            max_retries (int, optional): max collision-avoidance retries per waypoint. Defaults to 10.
+            perturb_scale (float, optional): magnitude (rad) of the random rest-config perturbation
+                applied between retries. Defaults to 0.1.
+            stop_on_collision (bool, optional): if True, planning halts at the first waypoint that
+                can't be resolved collision-free within `max_retries`, and the returned path is
+                truncated up to (and not including) that waypoint. If False, planning continues
+                using the best (still colliding) solution found for that waypoint. Defaults to True.
 
         Returns:
-            traj (np.array): joint trajectory
-            collision (bool): describes any collisions in the trajectory
+            joint_path (np.ndarray): array of joint configurations. Shorter than num_steps if
+                stop_on_collision truncated the path.
+            collision_in_path (bool): True if any returned waypoint is in self- or
+                environment-collision.
         """
-        start_position = start_pose[:3]
-        start_orientation = start_pose[3:]
+        start_config = np.array(start_config, dtype=float)
+        end_config = np.array(end_config, dtype=float)
 
-        end_position = end_pose[:3]
-        end_orientation = end_pose[3:]
+        start_position, start_orientation = self.robot.get_ee_pose(start_config)
+        end_position, end_orientation = self.robot.get_ee_pose(end_config)
+        self.robot.reset_joint_positions(start_config)
 
-        mid_position = np.copy(end_position)
-        mid_position[1] = start_position[1]
+        # Resolved to a concrete list (not None) since it's passed straight through to
+        # inverse_kinematics, where collision_objects=None means "skip the env check".
+        collision_objects = collision_objects if collision_objects is not None else self.robot.collision_objects
 
-        num_midpoints = 3
-        mid_positions = np.linspace(start_position, mid_position, num_midpoints + 2)
-        # mid_positions = np.linspace(start_position, end_position, num_midpoints + 2)
-        mid_positions[:, 1] = start_position[1]
+        slerp = Slerp([0, 1], R.from_quat([start_orientation, end_orientation]))
 
-        rotations = R.from_quat([start_orientation, end_orientation])
+        joint_path = np.zeros((num_steps, len(start_config)))
+        joint_path[0] = start_config
+        prev_config = start_config
+        collision_in_path = False
 
-        # Define key times (e.g., t=0 for start, t=1 for end)
-        times = np.array([0, 1])
+        for i, position in self._two_stage_waypoints(start_position, end_position, num_steps):
+            orientation = slerp(i / (num_steps - 1)).as_quat()
+            joint_config, collision_free = self.robot.inverse_kinematics(
+                (position, orientation), pos_tol=pos_tol, rest_config=list(prev_config),
+                max_iter=ik_max_iter, num_resample=max_retries,
+                collision_objects=collision_objects, perturb_scale=perturb_scale, return_status=True)
+            joint_config = self.shortest_angular_distance(prev_config, joint_config)
+            joint_path[i] = joint_config
+            prev_config = joint_config
+            if not collision_free:
+                collision_in_path = True
+                if stop_on_collision:
+                    return joint_path[:i], True
 
-        # Create SLERP object with two rotations
-        slerp = Slerp(times, rotations)
+        # Force the final waypoint to match the requested end configuration exactly
+        joint_path[-1] = self.shortest_angular_distance(joint_path[-2], end_config)
+        if self.robot.in_collision(end_config, collision_objects):
+            collision_in_path = True
 
-        # Interpolate at t = 0.5 (midpoint)
-        mid_rotation0 = slerp(0.25)
-        mid_rotation1 = slerp(0.5)
-        mid_rotation2 = slerp(0.75)
-
-        # Get the quaternion for the mid rotation
-        mid_orientation0 = mid_rotation0.as_quat()
-        mid_orientation1 = mid_rotation1.as_quat()
-        mid_orientation2 = mid_rotation2.as_quat()
-
-        mid_config0 = self.robot.inverse_kinematics(mid_positions[1], mid_orientation0, rest_config=list(start_config))
-        first_traj, path_collision0 = self.interpolate_joint_trajectory(start_config, mid_config0, int(num_steps/6))
-
-        mid_config1 = self.robot.inverse_kinematics(mid_positions[2], mid_orientation1, rest_config=list(first_traj[-1]))
-        second_traj, path_collision1 = self.interpolate_joint_trajectory(first_traj[-1], mid_config1, int(num_steps/6))
-
-        mid_config2 = self.robot.inverse_kinematics(mid_positions[3], mid_orientation2, rest_config=list(second_traj[-1]))
-        third_traj, path_collision2 = self.interpolate_joint_trajectory(second_traj[-1], mid_config2, int(num_steps/6))
-
-        fourth_traj, path_collision3 = self.interpolate_joint_trajectory(third_traj[-1], end_config, int(num_steps/2))
-
-        traj = np.vstack((first_traj, second_traj, third_traj, fourth_traj))
-
-        if path_collision0 or path_collision1 or path_collision2 or path_collision3:
-            collision = True
-        else:
-            collision = False
-
-        return traj, collision
-    
-    def task_space_path_interp(self, start_config, start_pose, end_config, end_pose, num_steps):
-        """ Interpolates a joint trajectory between a start and end joint configuration, where all intermediate configurations
-        are generated in task space while maintaining a desired start and end joint configuration.
-
-        Args:
-            start_config (np.array): starting joint coinfiguration
-            start_pose (np.array): starting end effector pose [x, y, z, rz, ry, rz, w]
-            end_config (np.array): ending joint coinfiguration
-            end_pose (np.array): ending end effector pose [x, y, z, rz, ry, rz, w]
-            num_steps (int): number of joint configurations in trajectory
-
-        Returns:
-            interpolated_configs (np.array): joint trajectory
-            collision_in_path (bool): describes any collisions in the trajectory
-        """
-        start_position = start_pose[:3]
-        start_orientation = start_pose[3:]
-
-        end_position = end_pose[:3]
-        end_orientation = end_pose[3:]
-
-        rotations = R.from_quat([start_orientation, end_orientation])
-
-        # Define key times (e.g., t=0 for start, t=1 for end)
-        times = np.array([0, 1])
-
-        # Create SLERP object with two rotations
-        slerp = Slerp(times, rotations)
-
-        # Split the number of steps for each phase
-        num_steps_phase1 = num_steps // 2  # First half for x and z translation
-        num_steps_phase2 = num_steps - num_steps_phase1  # Second half for y translation
-
-        # Create an empty array for storing interpolated joint configurations
-        interpolated_configs = np.zeros((num_steps, len(start_config)))
-        interpolated_configs[0] = start_config
-
-        # Phase 1: Interpolate x and z first, keep y constant
-        for i in range(1, num_steps_phase1):
-            # Interpolate x and z linearly between the start and end pose
-            interp_x = np.linspace(start_position[0], end_position[0], num_steps_phase1)[i]
-            interp_z = np.linspace(start_position[2], end_position[2], num_steps_phase1)[i]
-
-            # Keep y constant as the start y value
-            interp_y = start_position[1]
-
-            intermediate_position = np.array([interp_x, interp_y, interp_z])
-
-            # Interpolate orientation using SLERP
-            t = i / num_steps_phase1
-            intermediate_orientation = slerp(t).as_quat()  # Get interpolated orientation
-
-            # Create intermediate pose (x, y, z) + maintain original orientation
-            intermediate_pose = np.concatenate((intermediate_position, intermediate_orientation))
-
-            # Compute joint configuration for this pose using inverse kinematics
-            joint_config = self.robot.inverse_kinematics(intermediate_position, intermediate_orientation, rest_config=list(interpolated_configs[i-1]))
-            joint_config = self.shortest_angular_distance(interpolated_configs[i-1], joint_config)
-
-            interpolated_configs[i] = joint_config
-
-        # Phase 2: Interpolate y while keeping x and z fixed at their final values
-        for i in range(num_steps_phase2):
-            # Interpolate y linearly between the intermediate y and end y
-            interp_y = np.linspace(start_position[1], end_position[1], num_steps_phase2)[i]
-
-            # Keep x and z fixed at their final values
-            interp_x = end_position[0]
-            interp_z = end_position[2]
-
-            # Create final pose (x, y, z) + final orientation
-            final_position = np.array([interp_x, interp_y, interp_z])
-            
-            # Interpolate orientation using SLERP
-            t = i / num_steps_phase2
-            intermediate_orientation = slerp(0.5 + 0.5 * t).as_quat()  # Interpolate for second phase
-
-            intermediate_pose = np.concatenate((final_position, intermediate_orientation))
-
-            # Compute joint configuration for this pose using inverse kinematics
-            joint_config = self.robot.inverse_kinematics(final_position, intermediate_orientation, rest_config=list(interpolated_configs[i-1]))
-            joint_config = self.shortest_angular_distance(interpolated_configs[i-1], joint_config)
-            interpolated_configs[num_steps_phase1 + i] = joint_config
-        
-        # Force the last configuration to match end_config
-        interpolated_configs[-1] = end_config
-        interpolated_configs[-1] = self.shortest_angular_distance(interpolated_configs[-2], end_config)
-
-        # Check for collisions in the interpolated path
-        collision_in_path = any(self.robot.check_self_collision(config) for config in interpolated_configs)
-
-        return interpolated_configs, collision_in_path
+        return joint_path, collision_in_path
 
     def sample_path_to_length(self, path, desired_length):
         """ Takes a joint trajectory path of any length and interpolates to a desired array length
@@ -544,45 +473,43 @@ class KinematicChainMotionPlanner:
         # Interpolate each column separately
         return np.array([np.interp(new_indices, np.arange(current_path_len), path[:, i]) for i in range(num_joints)]).T
 
-    def vector_field_sample_fn(self, goal_position, alpha=0.8):
-        def sample():
-            random_conf = np.random.uniform([limit[0] for limit in self.robot.joint_limits], 
-                                            [limit[1] for limit in self.robot.joint_limits])
-            self.robot.set_joint_positions(random_conf)
-            end_effector_position, _ = self.robot.get_link_state(self.robot.end_effector_index)
-            
-            vector_to_goal = np.array(goal_position) - end_effector_position
-            guided_position = end_effector_position + vector_to_goal
-            # guided_conf = np.array(self.robot.robot.inverse_kinematics(guided_position, goal_orientation))
-            guided_conf = np.array(self.robot.inverse_kinematics(guided_position))
-            final_conf = (1 - alpha) * random_conf + alpha * guided_conf
-            
-            return final_conf
-        return sample
-    
     def make_strict_collision_fn(self, obstacles):
+        # in_collision resets the robot to q itself (via check_self_collision), so there's no
+        # need to separately drive it there with set_joint_configuration first.
         def fn(q):
-            # 1) move into q
-            self.robot.set_joint_configuration(q)
-            # 2) collision check
-            #  a) self-collision?
-            if self.robot.check_self_collision(q):
-                self.robot.detect_all_self_collisions(self.robot.robotId)
-                return True
-            #  b) environment collision?
-            if self.robot.collision_check(self.robot.robotId, obstacles):
-                self.robot.detect_all_self_collisions(self.robot.robotId)
-                return True
-            return False
+            return self.robot.in_collision(q, obstacles)
         return fn
 
-    def rrt_path(self, start_joint_config, end_joint_config, collision_objects=None, steps=None, rrt_iter=500):
+    def rrt_path(self, start_joint_config, end_joint_config, collision_objects=None, steps=None, rrt_iter=500,
+                 joint_weights=None, smooth=True, smooth_iterations=100):
+        """ Plans a joint-space path with RRT-Connect.
+
+        Args:
+            start_joint_config (array-like): starting joint configuration
+            end_joint_config (array-like): target joint configuration
+            collision_objects (list, optional): body IDs to check the path against
+            steps (int, optional): resample the final path to this many waypoints
+            rrt_iter (int, optional): max RRT-Connect iterations. Defaults to 500.
+            joint_weights (array-like, optional): per-joint weights for the distance metric used
+                to grow/connect the RRT trees. Higher weight makes RRT-Connect more reluctant to
+                move that joint, so weighting the proximal joints (shoulder/elbow) higher than the
+                wrist joints biases the search away from large shoulder/elbow swings. Defaults to
+                None (uniform weights, i.e. plain joint-space Euclidean distance).
+            smooth (bool, optional): whether to run a post-hoc shortcutting/smoothing pass on the
+                raw RRT-Connect path to remove the detours/backtracking RRT's random sampling tends
+                to leave behind. Defaults to True.
+            smooth_iterations (int, optional): max shortcutting iterations for the smoothing pass.
+                Defaults to 100.
+
+        Returns:
+            path (list or None): joint-space path, or None if the start/end configuration is in
+                collision or RRT-Connect found no path.
+        """
         extend_fn = get_extend_fn(self.robot.robotId, self.robot.controllable_joint_idx)
         # collision_fn = get_collision_fn(self.robot.robotId, self.robot.controllable_joint_idx, collision_objects)
         collision_fn = self.make_strict_collision_fn(collision_objects)
-        distance_fn = get_distance_fn(self.robot.robotId, self.robot.controllable_joint_idx)
+        distance_fn = get_distance_fn(self.robot.robotId, self.robot.controllable_joint_idx, weights=joint_weights)
         sample_fn = get_sample_fn(self.robot.robotId, self.robot.controllable_joint_idx)
-        # sample_fn = self.vector_field_sample_fn(target_pos)
 
         # Step 1: Early Exit - If Start is Already Close to Any Goal - Compute Euclidean distance (L2 norm)
         if np.linalg.norm(np.array(start_joint_config) - np.array(end_joint_config)) < 0.1:
@@ -592,7 +519,7 @@ class KinematicChainMotionPlanner:
         # Step 2: Early Collision Check
         if collision_fn(start_joint_config):
             # print("Start configuration is in collision. Skipping RRT.")
-            return None 
+            return None
         elif collision_fn(end_joint_config):
             # print("End configuration is in collision. Skipping RRT.")
             return None
@@ -605,7 +532,12 @@ class KinematicChainMotionPlanner:
             sample_fn=sample_fn,
             max_iterations=rrt_iter
         )
-        
+
+        # Step 3: Shortcut/smooth the raw path to remove RRT's characteristic detours
+        if path and smooth:
+            path = smooth_path(path, extend_fn=extend_fn, collision_fn=collision_fn,
+                                distance_fn=distance_fn, max_smooth_iterations=smooth_iterations)
+
         # Ensure the path has exactly `steps` joint configurations
         if path and steps: 
             path = self.sample_path_to_length(path, steps)

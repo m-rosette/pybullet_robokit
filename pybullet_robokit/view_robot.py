@@ -153,13 +153,22 @@ class ViewRobot:
         target_ori = np.array([90, 0, 180])
         target_ori = R.from_euler('xyz', target_ori, degrees=True).as_quat()
         target_pose = (target_pos, target_ori)
-        target_config = self.robot.inverse_kinematics(target_pose, pos_tol=self.ik_tol, max_iter=1000, resample=True, num_resample=10)
+        target_config = self.robot.inverse_kinematics(target_pose, pos_tol=self.ik_tol, max_iter=1000, num_resample=10)
 
         # Initialize the motion planner
         motion_planner = KinematicChainMotionPlanner(self.robot)
 
+        # Bias RRT-Connect away from large proximal-joint swings (higher weight on
+        # shoulder/elbow, lower on wrist), then shortcut/smooth the raw path afterward
+        # to remove RRT's characteristic detours and backtracking.
+        num_joints = len(self.robot.controllable_joint_idx)
+        joint_weights = np.linspace(num_joints, 1, num_joints)
+
         # Pass the start and target configurations to the RRT planner
-        joint_path = motion_planner.rrt_path(start_config, target_config, rrt_iter=1000, collision_objects=self.object_loader.collision_objects, steps=500)
+        joint_path = motion_planner.rrt_path(start_config, target_config, rrt_iter=1000,
+                                              collision_objects=self.object_loader.collision_objects,
+                                              steps=500, joint_weights=joint_weights,
+                                              smooth=True, smooth_iterations=150)
 
         # Check if the path is valid
         if joint_path is None:
@@ -168,7 +177,9 @@ class ViewRobot:
         else:
             print("\nRRT path planning succeeded.\n")
 
+        path_cost = np.sum(np.linalg.norm(np.diff(np.array(joint_path), axis=0), axis=1))
         print(len(joint_path), "steps in the path")
+        print(f"Total joint-space travel: {path_cost:.3f} rad\n")
 
         # Execute the planned joint path
         self.robot.set_joint_path(joint_path)
@@ -220,7 +231,7 @@ class ViewRobot:
             self.robot.set_joint_configuration(self.robot.home_config)
         
             # Move arm to the target pose using inverse kinematics
-            joint_config = self.robot.inverse_kinematics(position, pos_tol=self.ik_tol, max_iter=1000, resample=False)
+            joint_config = self.robot.inverse_kinematics(position, pos_tol=self.ik_tol, max_iter=1000, num_resample=0)
 
             # if self.robot.check_collision_aabb(self.robot.robotId, self.robot.robotId):
             #     print("Collision detected!")
@@ -243,34 +254,160 @@ class ViewRobot:
         while True:
             self.pyb.con.stepSimulation()
 
-            
+
+def load_amiga_ur5e_env(renders=True):
+    """ Loads the UR5e mounted on the Amiga, with the Amiga chassis and mounted hardware
+    (slider, mast, GPS/Oak camera housing, Amiga Brain) as collision primitives.
+
+    Returns:
+        pyb (PybUtils): the PyBullet client wrapper
+        object_loader (LoadObjects): holds the environment's collision_objects
+        robot (LoadRobot): the loaded UR5e
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    ur5e_urdf_path = os.path.join(script_dir, 'urdf', 'robots', 'ur5e', 'ur5e.urdf')
+    amiga_mesh_path = os.path.join(script_dir, 'urdf', 'robots', 'amiga', 'visual', 'frame_on_amiga_v2_simplified.stl')
+
+    pyb = PybUtils(renders=renders)
+    object_loader = LoadObjects(pyb.con)
+
+    # Amiga chassis + mounted hardware as simple collision primitives
+    slider_id = pyb.con.createMultiBody(
+        baseCollisionShapeIndex=pyb.con.createCollisionShape(pyb.con.GEOM_BOX, halfExtents=[0.6, 0.1, 0.075]),
+        basePosition=[0.0, 0.29845, 0.96])
+    mast_id = pyb.con.createMultiBody(
+        baseCollisionShapeIndex=pyb.con.createCollisionShape(pyb.con.GEOM_BOX, halfExtents=[0.035, 0.035, 0.475]),
+        basePosition=[0.57, -0.15, 1.03])
+    gps_oak_id = pyb.con.createMultiBody(
+        baseCollisionShapeIndex=pyb.con.createCollisionShape(pyb.con.GEOM_BOX, halfExtents=[0.075, 0.10, 0.10]),
+        basePosition=[0.57, -0.15, 1.62])
+    brain_id = pyb.con.createMultiBody(
+        baseCollisionShapeIndex=pyb.con.createCollisionShape(pyb.con.GEOM_BOX, halfExtents=[0.145, 0.10, 0.0875]),
+        basePosition=[0.57, -0.315, 1.25])
+    amiga_frame_id = pyb.con.createMultiBody(
+        baseCollisionShapeIndex=pyb.con.createCollisionShape(
+            pyb.con.GEOM_MESH, fileName=amiga_mesh_path, flags=pyb.con.GEOM_FORCE_CONCAVE_TRIMESH),
+        baseVisualShapeIndex=-1,
+        basePosition=[0, 0, 0])
+    object_loader.collision_objects.extend([amiga_frame_id, slider_id, mast_id, gps_oak_id, brain_id])
+
+    robot_home_pos = [np.pi/4, -np.pi/2, 2*np.pi/3, 5*np.pi/6, -np.pi/2, 0]
+    robot = LoadRobot(pyb.con,
+                       ur5e_urdf_path,
+                       [-0.092075, 0.29845, 1.04775],
+                       pyb.con.getQuaternionFromEuler([0, 0, 0]),
+                       robot_home_pos,
+                       collision_objects=object_loader.collision_objects,
+                       ee_link_name='tool0')
+
+    return pyb, object_loader, robot
+
+
+def two_stage_cartesian_demo(renders=True, num_steps=150):
+    """ Plans and executes a two-stage Cartesian path on the UR5e-on-Amiga: world X/Z motion
+    (reach depth and height) followed by world Y motion (reach out to the side).
+    """
+    pyb, object_loader, robot = load_amiga_ur5e_env(renders=renders)
+    motion_planner = KinematicChainMotionPlanner(robot)
+
+    # Example target: reach forward/up in X/Z, then out to the side in Y
+    start_config = robot.home_config
+    start_position, start_orientation = robot.get_link_state(robot.end_effector_index)
+    target_position = start_position + np.array([0.15, 0.2, 0.05])
+    end_config = robot.inverse_kinematics((target_position, start_orientation), pos_tol=0.01,
+                                           rest_config=start_config, max_iter=1000)
+
+    joint_path, collision_in_path = motion_planner.two_stage_cartesian_path(
+        start_config, end_config, num_steps=num_steps)
+
+    print(f"\nTwo-stage Cartesian path: {len(joint_path)} steps, collision_in_path={collision_in_path}\n")
+
+    robot.reset_joint_positions(start_config)
+    robot.set_joint_path(joint_path)
+
+    print("Test complete. Holding final pose. Press Ctrl+C to exit.")
+    while True:
+        robot.reset_joint_positions(joint_path[-1])
+        pyb.con.stepSimulation()
+
+
+def rrt_amiga_demo(renders=True, rrt_iter=1000, steps=500):
+    """ Plans and executes an RRT-Connect path on the UR5e-on-Amiga, using the joint-weighted
+    distance metric and shortcutting/smoothing pass from `KinematicChainMotionPlanner.rrt_path`
+    to avoid the large, "wacky" joint swings plain RRT-Connect tends to produce.
+    """
+    pyb, object_loader, robot = load_amiga_ur5e_env(renders=renders)
+    motion_planner = KinematicChainMotionPlanner(robot)
+
+    # Same example target as the two-stage Cartesian demo, for an apples-to-apples comparison
+    start_config = robot.home_config
+    start_position, start_orientation = robot.get_link_state(robot.end_effector_index)
+    target_position = start_position + np.array([0.15, 0.2, 0.05])
+    end_config = robot.inverse_kinematics((target_position, start_orientation), pos_tol=0.01,
+                                           rest_config=start_config, max_iter=1000)
+
+    # Bias RRT-Connect away from large proximal-joint swings, then shortcut/smooth the raw path
+    num_joints = len(robot.controllable_joint_idx)
+    joint_weights = np.linspace(num_joints, 1, num_joints)
+
+    joint_path = motion_planner.rrt_path(start_config, end_config, rrt_iter=rrt_iter,
+                                          collision_objects=object_loader.collision_objects,
+                                          steps=steps, joint_weights=joint_weights,
+                                          smooth=True, smooth_iterations=150)
+
+    if joint_path is None:
+        print("\nRRT path planning failed.\n")
+        return
+
+    path_cost = np.sum(np.linalg.norm(np.diff(np.array(joint_path), axis=0), axis=1))
+    print(f"\nRRT path planning succeeded: {len(joint_path)} steps, "
+          f"total joint-space travel: {path_cost:.3f} rad\n")
+
+    robot.reset_joint_positions(start_config)
+    robot.set_joint_path(joint_path)
+
+    print("Test complete. Holding final pose. Press Ctrl+C to exit.")
+    while True:
+        robot.reset_joint_positions(joint_path[-1])
+        pyb.con.stepSimulation()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="View a robot in PyBullet simulation.")
     parser.add_argument("-u", "--urdf_path", type=str, default="example_6dof_manipulator.urdf", 
                         help="URDF file path or name (default: example_6dof_manipulator.urdf)")
     parser.add_argument("--render", action="store_true", help="Enable rendering in PyBullet")
     parser.add_argument("--no-render", action="store_false", dest="render", help="Disable rendering in PyBullet")
-    
+    parser.add_argument("--demo", choices=["rrt", "cartesian_two_stage", "rrt_amiga"], default="rrt",
+                        help="Which demo to run (default: rrt). 'cartesian_two_stage' and "
+                             "'rrt_amiga' both run on the UR5e-on-Amiga scenario, planning with "
+                             "the two-stage Cartesian planner and RRT-Connect respectively.")
+
     parser.set_defaults(render=True)  # Default to True
     args = parser.parse_args()
+
+    if args.demo == "cartesian_two_stage":
+        two_stage_cartesian_demo(renders=args.render)
+        raise SystemExit
+    elif args.demo == "rrt_amiga":
+        rrt_amiga_demo(renders=args.render)
+        raise SystemExit
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_urdf_dir = os.path.join(script_dir, 'urdf', 'robots')
     default_urdf_file = os.path.join(default_urdf_dir, "example_6dof_manipulator.urdf")
     
     robot_urdf_path = get_urdf_path(args.urdf_path, default_urdf_dir, default_urdf_file)
-    ee_link_name = 'end_effector' if "best_chain" or 'test_robot' in robot_urdf_path else 'gripper_link'
-    # ee_link_name = 'tool0'
-    
+
     robot_home_pos = None
 
     print(f"\nLoading robot from: {robot_urdf_path}\n")
-    
-    view_robot = ViewRobot(robot_urdf_path=robot_urdf_path, 
+
+    view_robot = ViewRobot(robot_urdf_path=robot_urdf_path,
                            renders=args.render,
                            robot_home_pos=robot_home_pos,
                            ik_tol=0.1,
-                           ee_link_name=ee_link_name)
+                           ee_link_name=None)
     
     # view_robot.test_resolved_rate_motion_control()
     # view_robot.main() 
