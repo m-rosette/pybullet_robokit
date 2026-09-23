@@ -283,19 +283,30 @@ class LoadRobot:
         self.con.setJointMotorControlArray(self.robotId, self.controllable_joint_idx, self.con.POSITION_CONTROL, targetPositions=joint_positions, positionGains=[0.01]*len(joint_positions), velocityGains=[0.5]*len(joint_positions))
         self.con.stepSimulation()
 
-    def reset_joint_positions(self, joint_positions=None):
+    def reset_joint_positions(self, joint_positions=None, step_sim=False):
+        """ Teleports the robot to `joint_positions` via resetJointState (bypasses the
+        constraint solver) and refreshes contact info for collision queries.
+
+        Args:
+            joint_positions (array-like, optional): joint values. Defaults to home_config.
+            step_sim (bool, optional): also advance physics by one step after the reset.
+                Only needed to drive the GUI's rendered clock forward for visualization;
+                collision/IK/FK queries want the exact state just set, not a physics-
+                perturbed one, so this defaults to False. See set_joint_path. Defaults to False.
+        """
         if joint_positions is None:
             joint_positions = self.home_config
         joint_positions = list(joint_positions)
         for i, joint_idx in enumerate(self.controllable_joint_idx):
             self.con.resetJointState(self.robotId, joint_idx, joint_positions[i])
         self.con.performCollisionDetection()  # Ensures up-to-date contact info
-        self.con.stepSimulation()
+        if step_sim:
+            self.con.stepSimulation()
 
     def set_joint_path(self, joint_path, delay=0.01):
         # Vizualize the interpolated positions
         for config in joint_path:
-            self.reset_joint_positions(config)
+            self.reset_joint_positions(config, step_sim=True)
             time.sleep(delay)  # Add a small delay for visualization purposes
 
     def get_joint_positions(self):
@@ -313,7 +324,6 @@ class LoadRobot:
         return self.get_link_state(self.end_effector_index)
 
     def check_self_collision(self, joint_config):
-        # Set the joint state and step the simulation
         self.reset_joint_positions(joint_config)
 
         # Return collision bool
