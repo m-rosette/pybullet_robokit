@@ -61,37 +61,15 @@ class KinematicChainMotionPlanner:
         Returns:
         - adjusted_end_configuration: numpy array of end joint angles modified to take the shortest angular distance to the start configuration
         """
-        # Ensure inputs are numpy arrays for vectorized operations
-        start_configuration = np.array(start_configuration)
-        end_configuration = np.array(end_configuration)
+        start_configuration = np.array(start_configuration, dtype=float)
+        end_configuration = np.array(end_configuration, dtype=float)
 
-        # Normalize both configurations to [-pi, pi]
-        start_configuration = (start_configuration + np.pi) % (2 * np.pi) - np.pi
-        end_configuration = (end_configuration + np.pi) % (2 * np.pi) - np.pi
+        # Wrap only the difference, never the start itself: wrapping the start into [-pi, pi]
+        # teleports any joint sitting outside that range (e.g. wrist 1 at 5pi/6 drifting past pi)
+        # by 2pi, which shows up as a full-turn jump in the path.
+        shortest_difference = (end_configuration - start_configuration + np.pi) % (2 * np.pi) - np.pi
 
-        # Calculate the angular difference between start and end configurations
-        angular_difference = end_configuration - start_configuration
-
-        # Wrap the angular difference to be within [-pi, pi]
-        adjusted_difference = (angular_difference + np.pi) % (2 * np.pi) - np.pi
-
-        # Check both paths: (end - start) and (end - start - 2*pi)
-        adjusted_end_minus_2pi = end_configuration - 2 * np.pi
-        adjusted_end_plus_2pi = end_configuration + 2 * np.pi
-
-        # Compute all possible angular differences
-        diff_original = adjusted_difference
-        diff_minus_2pi = (adjusted_end_minus_2pi - start_configuration + np.pi) % (2 * np.pi) - np.pi
-        diff_plus_2pi = (adjusted_end_plus_2pi - start_configuration + np.pi) % (2 * np.pi) - np.pi
-
-        # Choose the smallest angular difference for each joint
-        shortest_difference = np.where(np.abs(diff_minus_2pi) < np.abs(diff_original), diff_minus_2pi, diff_original)
-        shortest_difference = np.where(np.abs(diff_plus_2pi) < np.abs(shortest_difference), diff_plus_2pi, shortest_difference)
-
-        # Adjust the end configuration based on the shortest angular difference
-        adjusted_end_configuration = start_configuration + shortest_difference
-
-        return adjusted_end_configuration
+        return start_configuration + shortest_difference
 
     def interpolate_joint_trajectory(self, start_config, end_config, num_steps, collision_objects=None):
         """
@@ -452,6 +430,142 @@ class KinematicChainMotionPlanner:
             collision_in_path = True
 
         return joint_path, collision_in_path
+
+    def _approach_waypoints(self, start_position, start_orientation, goal_position, goal_orientation,
+                            approach_axis, approach_dist, lin_res, ang_res):
+        """ Builds dense (position, Rotation) waypoints for a retract -> traverse -> approach path.
+
+        With `a` the goal's approach axis in the world frame and s(p) = a . p the progress along
+        it, the path runs through the clearance plane s = s_c, s_c = min(s(start), s(goal) - approach_dist):
+          A. retract along -a from the start until s = s_c (empty if the start is already behind it)
+          B. traverse within that plane to the approach line through the goal
+          C. approach along +a to the goal, covering at least `approach_dist`
+        Orientation is slerped from start to goal across A+B and held at the goal orientation
+        through C, so the final approach is a pure straight-line motion.
+        """
+        goal_rotation = R.from_quat(goal_orientation)
+        a = goal_rotation.apply(np.asarray(approach_axis, dtype=float))
+        a /= np.linalg.norm(a)
+
+        s_start = a @ start_position
+        s_goal = a @ goal_position
+        s_clear = min(s_start, s_goal - approach_dist)
+        retract_position = start_position - (s_start - s_clear) * a
+        pre_approach_position = goal_position - (s_goal - s_clear) * a
+
+        # Stages A+B as one polyline, parameterized by arc length so orientation progresses evenly
+        corners = np.array([start_position, retract_position, pre_approach_position])
+        seg_lengths = np.linalg.norm(np.diff(corners, axis=0), axis=1)
+        cum_lengths = np.concatenate(([0.0], np.cumsum(seg_lengths)))
+        ab_length = cum_lengths[-1]
+
+        slerp = Slerp([0, 1], R.concatenate([R.from_quat(start_orientation), goal_rotation]))
+        ab_angle = (goal_rotation * R.from_quat(start_orientation).inv()).magnitude()
+        n_ab = max(1, int(np.ceil(ab_length / lin_res)), int(np.ceil(ab_angle / ang_res)))
+
+        waypoints = []
+        for t in np.linspace(0, 1, n_ab + 1)[1:]:
+            if ab_length > 0:
+                d = t * ab_length
+                k = min(np.searchsorted(cum_lengths, d, side='right') - 1, len(seg_lengths) - 1)
+                frac = 0.0 if seg_lengths[k] == 0 else (d - cum_lengths[k]) / seg_lengths[k]
+                position = corners[k] + frac * (corners[k + 1] - corners[k])
+            else:
+                position = start_position  # pure in-place reorientation
+            waypoints.append((position, slerp(t)))
+
+        # Stage C: straight approach at the fixed goal orientation
+        c_length = s_goal - s_clear
+        n_c = max(1, int(np.ceil(c_length / lin_res)))
+        for t in np.linspace(0, 1, n_c + 1)[1:]:
+            waypoints.append((pre_approach_position + t * (goal_position - pre_approach_position), goal_rotation))
+
+        return waypoints
+
+    def _local_ik(self, q, target_position, target_rotation, pos_tol, ori_tol, max_iter, damping):
+        """ Damped-least-squares IK seeded at `q`. Converges to the solution nearest `q` and so
+        never hops IK branches, unlike PyBullet's global IK. Returns (q, converged, manipulability). """
+        lower, upper = np.array(self.robot.lower_limits), np.array(self.robot.upper_limits)
+        for _ in range(max_iter + 1):
+            position, orientation = self.robot.forward_kinematics(q)
+            pos_err = target_position - position
+            ori_err = (target_rotation * R.from_quat(orientation).inv()).as_rotvec()
+            J = self.robot.get_jacobian(q)
+            JJt = J @ J.T
+            if np.linalg.norm(pos_err) < pos_tol and np.linalg.norm(ori_err) < ori_tol:
+                return q, True, np.sqrt(max(np.linalg.det(JJt), 0.0))
+            dq = J.T @ np.linalg.solve(JJt + damping**2 * np.eye(6), np.concatenate((pos_err, ori_err)))
+            q = np.clip(q + dq, lower, upper)
+        return q, False, 0.0
+
+    def approach_cartesian_path(self, start_config, goal_pose, num_steps=100, approach_dist=0.15,
+                                approach_axis=(0, 0, 1), collision_objects=None, lin_res=0.005,
+                                ang_res=np.deg2rad(2), max_joint_step=0.1, min_manipulability=0.003,
+                                pos_tol=1e-3, ori_tol=np.deg2rad(0.5), ik_max_iter=20, damping=0.01):
+        """ Plans a retract -> traverse -> approach Cartesian path (see `_approach_waypoints`)
+        and tracks it with local IK, so the joint path is continuous by construction.
+
+        Waypoints are tracked densely (every `lin_res` m / `ang_res` rad), each solve seeded
+        from the previous one. Rather than ever jumping to another IK branch, the path is
+        rejected if any waypoint fails to converge, moves a joint more than `max_joint_step`,
+        drops below `min_manipulability` (i.e. passes near a singularity, where branch flips
+        happen), or is in collision. The goal is given as a pose, not a configuration: the goal
+        configuration is wherever the continuous path ends up, i.e. `joint_path[-1]`.
+
+        Args:
+            start_config (array-like): starting joint configuration
+            goal_pose (tuple): (position, quaternion xyzw) of the end-effector at the goal
+            num_steps (int, optional): number of waypoints in the returned path. Defaults to 100.
+            approach_dist (float, optional): minimum length (m) of the final straight approach. Defaults to 0.15.
+            approach_axis (array-like, optional): approach direction in the end-effector frame. Defaults to +z.
+            collision_objects (list, optional): body IDs to check against. Defaults to the robot's collision_objects.
+            lin_res (float, optional): tracking resolution (m). Defaults to 0.005.
+            ang_res (float, optional): tracking resolution (rad). Defaults to 2 deg.
+            max_joint_step (float, optional): max joint change (rad) between dense waypoints. Defaults to 0.1.
+            min_manipulability (float, optional): Yoshikawa manipulability floor along the path. For the UR5e,
+                0.003 is roughly 6 deg from the elbow or wrist singularity. Defaults to 0.003.
+            pos_tol, ori_tol (float, optional): per-waypoint IK tolerances (m, rad).
+            ik_max_iter (int, optional): max DLS iterations per waypoint. Defaults to 20.
+            damping (float, optional): DLS damping. Defaults to 0.01.
+
+        Returns:
+            joint_path (np.ndarray or None): (num_steps, n) joint path, or None on failure.
+            info (dict): 'status' ('ok', 'ik_failed', 'joint_jump', 'low_manipulability' or
+                'collision'), 'min_manipulability' along the tracked portion, and 'failed_at'
+                (dense waypoint index, or None).
+        """
+        collision_objects = collision_objects if collision_objects is not None else self.robot.collision_objects
+        q = np.array(start_config, dtype=float)
+        start_position, start_orientation = self.robot.forward_kinematics(q)
+        goal_position, goal_orientation = np.asarray(goal_pose[0], dtype=float), np.asarray(goal_pose[1], dtype=float)
+
+        waypoints = self._approach_waypoints(start_position, start_orientation, goal_position, goal_orientation,
+                                             approach_axis, approach_dist, lin_res, ang_res)
+
+        dense_path = [q]
+        min_manip = self.robot.calculate_manipulability(q)
+        info = {'status': 'ok', 'min_manipulability': min_manip, 'failed_at': None}
+
+        for k, (position, rotation) in enumerate(waypoints):
+            q_next, converged, manip = self._local_ik(q, position, rotation, pos_tol, ori_tol, ik_max_iter, damping)
+            min_manip = min(min_manip, manip)
+            info['min_manipulability'] = min_manip
+            if not converged:
+                status = 'ik_failed'
+            elif np.max(np.abs(q_next - q)) > max_joint_step:
+                status = 'joint_jump'
+            elif manip < min_manipulability:
+                status = 'low_manipulability'
+            elif self.robot.in_collision(q_next, collision_objects):
+                status = 'collision'
+            else:
+                q = q_next
+                dense_path.append(q)
+                continue
+            info.update(status=status, failed_at=k)
+            return None, info
+
+        return self.sample_path_to_length(dense_path, num_steps), info
 
     def sample_path_to_length(self, path, desired_length):
         """ Takes a joint trajectory path of any length and interpolates to a desired array length
