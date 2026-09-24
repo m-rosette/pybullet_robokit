@@ -61,4 +61,5 @@ class PybUtils:
         self.con.setGravity(0, 0, -9.81)
 
     def disconnect(self):
-        self.con.disconnect()
+        if self.con.isConnected():
+            self.con.disconnect()

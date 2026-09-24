@@ -323,6 +323,16 @@ class LoadRobot:
         self.reset_joint_positions(joint_config)
         return self.get_link_state(self.end_effector_index)
 
+    def forward_kinematics(self, joint_config):
+        """ Resets to `joint_config` and returns the end-effector (position, orientation).
+        Unlike get_ee_pose, this skips the collision-detection pass, so it's the cheaper
+        choice for tight IK loops that only need the pose.
+        """
+        for i, joint_idx in enumerate(self.controllable_joint_idx):
+            self.con.resetJointState(self.robotId, joint_idx, joint_config[i])
+        link_state = self.con.getLinkState(self.robotId, self.end_effector_index, computeForwardKinematics=True)
+        return np.array(link_state[0]), np.array(link_state[1])
+
     def check_self_collision(self, joint_config):
         self.reset_joint_positions(joint_config)
 
