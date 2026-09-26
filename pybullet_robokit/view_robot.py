@@ -1,4 +1,11 @@
 import os
+import sys
+import glob
+import queue
+import select
+import termios
+import threading
+import tty
 import argparse
 import numpy as np
 import time
@@ -255,18 +262,27 @@ class ViewRobot:
             self.pyb.con.stepSimulation()
 
 
-def load_amiga_ur5e_env(renders=True):
+def load_amiga_ur5e_env(renders=True, urdf_dir=None, robot_base_yaw=0.0, ee_link_name='tool0'):
     """ Loads the UR5e mounted on the Amiga, with the Amiga chassis and mounted hardware
     (slider, mast, GPS/Oak camera housing, Amiga Brain) as collision primitives.
+
+    Args:
+        renders (bool, optional): visualize the robot in the PyBullet GUI. Defaults to True.
+        urdf_dir (str, optional): directory holding ur5e/ur5e.urdf and
+            amiga/visual/frame_on_amiga_v2_simplified.stl. Defaults to this package's urdf/robots.
+        robot_base_yaw (float, optional): rotation of the robot base about world z, in radians.
+            Defaults to 0.
+        ee_link_name (str, optional): end-effector link name. Defaults to 'tool0'.
 
     Returns:
         pyb (PybUtils): the PyBullet client wrapper
         object_loader (LoadObjects): holds the environment's collision_objects
         robot (LoadRobot): the loaded UR5e
     """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    ur5e_urdf_path = os.path.join(script_dir, 'urdf', 'robots', 'ur5e', 'ur5e.urdf')
-    amiga_mesh_path = os.path.join(script_dir, 'urdf', 'robots', 'amiga', 'visual', 'frame_on_amiga_v2_simplified.stl')
+    if urdf_dir is None:
+        urdf_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'urdf', 'robots')
+    ur5e_urdf_path = os.path.join(urdf_dir, 'ur5e', 'ur5e.urdf')
+    amiga_mesh_path = os.path.join(urdf_dir, 'amiga', 'visual', 'frame_on_amiga_v2_simplified.stl')
 
     pyb = PybUtils(renders=renders)
     object_loader = LoadObjects(pyb.con)
@@ -295,12 +311,226 @@ def load_amiga_ur5e_env(renders=True):
     robot = LoadRobot(pyb.con,
                        ur5e_urdf_path,
                        [-0.092075, 0.29845, 1.04775],
-                       pyb.con.getQuaternionFromEuler([0, 0, 0]),
+                       pyb.con.getQuaternionFromEuler([0, 0, robot_base_yaw]),
                        robot_home_pos,
                        collision_objects=object_loader.collision_objects,
-                       ee_link_name='tool0')
+                       ee_link_name=ee_link_name)
 
     return pyb, object_loader, robot
+
+
+def resolve_cached_paths_file(paths_file):
+    """ Resolves a cached-trajectory .npy file, given either the file itself or a run directory
+    (in which case the newest reachable_paths_merged_*.npy in it is used). """
+    if os.path.isdir(paths_file):
+        candidates = sorted(glob.glob(os.path.join(paths_file, 'reachable_paths_merged_*.npy')))
+        if not candidates:
+            raise FileNotFoundError(f"No reachable_paths_merged_*.npy found in {paths_file}")
+        return candidates[-1]
+    return paths_file
+
+
+def find_matching_voxels_file(paths_file):
+    """ Finds the reachable_voxels csv saved alongside a reachable_paths npy (same tag, e.g.
+    '_merged' or '_w0003'). Its rows line up with the paths' last axis. Returns None if absent.
+
+    The two files are saved separately, so their timestamps can differ by a second - match on
+    the tag rather than the full name, and take the newest match.
+    """
+    stem = os.path.splitext(os.path.basename(paths_file))[0]
+    tag = stem[len('reachable_paths'):-len('_YYYYmmdd_HHMMSS')]
+    candidates = sorted(glob.glob(os.path.join(os.path.dirname(paths_file), f'reachable_voxels{tag}_*.csv')))
+    return candidates[-1] if candidates else None
+
+
+def view_cached_trajectories(paths_file, urdf_dir=None, robot_base_yaw=np.pi/4, ee_link_name='gripper_link',
+                             index=None, delay=0.01):
+    """ Loads trajectories cached by trajectory_cache (an npy of shape (num_configs, num_joints,
+    num_paths)) and plays back the chosen one on the UR5e-on-Amiga in the PyBullet GUI.
+
+    Indices are entered at a terminal prompt (read in the background, so the GUI stays live and a
+    new index interrupts the current playback), or stepped with the Left/Right arrow keys in the GUI
+    window or the terminal (NaN paths are skipped).
+    The target voxel for the path (if its reachable_voxels csv is found) is drawn as a green sphere.
+
+    Args:
+        paths_file (str): reachable_paths*.npy file, or a run directory containing a merged one.
+        urdf_dir (str, optional): see load_amiga_ur5e_env.
+        robot_base_yaw (float, optional): must match the base yaw the paths were generated with.
+            Defaults to pi/4 (what trajectory_cache's path_cache/parallel_cache use).
+        ee_link_name (str, optional): end-effector link name. Defaults to 'gripper_link'.
+        index (int, optional): path to play first. Defaults to None (wait for input).
+        delay (float, optional): seconds between configs during playback. Defaults to 0.01.
+    """
+    paths_file = resolve_cached_paths_file(paths_file)
+    paths = np.load(paths_file)
+    num_paths = paths.shape[2]
+    print(f"\nLoaded {num_paths} paths of {paths.shape[0]} configs x {paths.shape[1]} joints from {paths_file}")
+
+    voxels_file = find_matching_voxels_file(paths_file)
+    voxels = np.loadtxt(voxels_file).reshape(-1, 3) if voxels_file else None
+    if voxels is not None and len(voxels) != num_paths:
+        print(f"Warning: {voxels_file} has {len(voxels)} rows but there are {num_paths} paths; "
+              f"not showing target voxels.")
+        voxels = None
+
+    valid = ~np.isnan(paths).any(axis=(0, 1))
+    if not valid.any():
+        print("No valid paths in this file.")
+        return
+
+    pyb, object_loader, robot = load_amiga_ur5e_env(renders=True, urdf_dir=urdf_dir,
+                                                    robot_base_yaw=robot_base_yaw, ee_link_name=ee_link_name)
+    target_visual = pyb.con.createVisualShape(pyb.con.GEOM_SPHERE, radius=0.02, rgbaColor=[0, 1, 0, 0.8])
+    target_id = None
+    current = None
+    joint_path = None
+    frame = 0
+
+    # Read terminal input on a background thread so the GUI stays live while waiting for an
+    # index. Commands (typed lines, or 'next'/'prev' for arrow keys) go to the main loop via a queue.
+    commands = queue.Queue()
+    arrow_commands = {b'[C': 'next', b'[D': 'prev'}
+
+    def read_keys():
+        """ Terminal in cbreak mode: arrow keys act immediately, other keys build up a line
+        (echoed by hand, since cbreak turns echo off) that is submitted on Enter. """
+        fd = sys.stdin.fileno()
+        buf = ''
+        while True:
+            ch = os.read(fd, 1)
+            if ch in (b'', b'\x04'):  # stdin closed / Ctrl+D
+                commands.put('q')
+                return
+            if ch == b'\x1b':
+                # Arrow keys arrive as ESC [ C/D; a lone Esc has nothing following it
+                seq = os.read(fd, 2) if select.select([fd], [], [], 0.05)[0] else b''
+                if seq in arrow_commands:
+                    buf = ''
+                    commands.put(arrow_commands[seq])
+            elif ch in (b'\n', b'\r'):
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+                commands.put(buf.strip().lower())
+                buf = ''
+            elif ch in (b'\x7f', b'\x08'):
+                if buf:
+                    buf = buf[:-1]
+                    sys.stdout.write('\b \b')
+                    sys.stdout.flush()
+            else:
+                c = ch.decode(errors='ignore')
+                if c.isprintable():
+                    buf += c
+                    sys.stdout.write(c)
+                    sys.stdout.flush()
+
+    def read_lines():
+        """ Fallback when stdin isn't a terminal: whole lines only. """
+        for line in sys.stdin:
+            line = line.strip().lower()
+            commands.put(arrow_commands.get(line[1:].upper().encode(), line) if line.startswith('\x1b') else line)
+        commands.put('q')
+
+    old_term = None
+    if sys.stdin.isatty():
+        old_term = termios.tcgetattr(sys.stdin.fileno())
+        tty.setcbreak(sys.stdin.fileno())
+        threading.Thread(target=read_keys, daemon=True).start()
+    else:
+        threading.Thread(target=read_lines, daemon=True).start()
+    prompt = (f"Path index [0-{num_paths - 1}], Enter/'r' to replay, 'q' to quit, "
+              f"Left/Right arrows to step: ")
+
+    def step_valid(start, direction):
+        """ Next index from `start` in `direction` (+1/-1) that has a valid path, wrapping around. """
+        i = start
+        for _ in range(num_paths):
+            i = (i + direction) % num_paths
+            if valid[i]:
+                return i
+        return start
+
+    def play(i):
+        nonlocal current, joint_path, frame, target_id
+        if not valid[i]:
+            print(f"Path {i} contains NaNs (no valid path was found for it); skipping.")
+            return
+        current = i
+        joint_path = paths[:, :, current]
+        frame = 0
+        if target_id is not None:
+            pyb.con.removeBody(target_id)
+            target_id = None
+        msg = f"Playing path {current}"
+        if voxels is not None:
+            target_id = pyb.con.createMultiBody(baseVisualShapeIndex=target_visual, basePosition=voxels[current])
+            msg += f" to voxel {np.round(voxels[current], 3).tolist()}"
+        print(msg)
+
+    def step(direction):
+        """ Plays the previous (-1) / next (+1) valid path. """
+        start = current if current is not None else (-1 if direction > 0 else 0)
+        play(step_valid(start, direction))
+
+    if index is not None:
+        if -num_paths <= index < num_paths:
+            play(index % num_paths)
+        else:
+            print(f"Index {index} out of range [0, {num_paths - 1}]")
+    print(prompt, end='', flush=True)
+
+    try:
+        while pyb.con.isConnected():
+            # Terminal commands
+            quit_requested = False
+            while not commands.empty():
+                reply = commands.get()
+                if reply in ('q', 'quit', 'exit'):
+                    quit_requested = True
+                    break
+                if reply in ('next', 'prev'):
+                    print()
+                    step(1 if reply == 'next' else -1)
+                elif reply in ('r', ''):
+                    if current is not None:
+                        play(current)
+                else:
+                    try:
+                        i = int(reply)
+                    except ValueError:
+                        print(f"Not an index: {reply!r}")
+                    else:
+                        if -num_paths <= i < num_paths:
+                            play(i % num_paths)
+                        else:
+                            print(f"Index {i} out of range [0, {num_paths - 1}]")
+                print(prompt, end='', flush=True)
+            if quit_requested:
+                break
+
+            # GUI arrow keys step to the previous/next valid path
+            keys = pyb.con.getKeyboardEvents()
+            for key, direction in ((pyb.con.B3G_RIGHT_ARROW, 1), (pyb.con.B3G_LEFT_ARROW, -1)):
+                if keys.get(key, 0) & pyb.con.KEY_WAS_TRIGGERED:
+                    print()
+                    step(direction)
+                    print(prompt, end='', flush=True)
+
+            # Advance playback one config per tick so new commands can interrupt it
+            if joint_path is not None and frame < len(joint_path):
+                robot.reset_joint_positions(joint_path[frame], step_sim=True)
+                frame += 1
+                time.sleep(delay)
+            else:
+                time.sleep(0.01)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if old_term is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_term)
+
+    print()  # PybUtils disconnects on exit
 
 
 def two_stage_cartesian_demo(renders=True, num_steps=150):
@@ -378,15 +608,41 @@ if __name__ == "__main__":
                         help="URDF file path or name (default: example_6dof_manipulator.urdf)")
     parser.add_argument("--render", action="store_true", help="Enable rendering in PyBullet")
     parser.add_argument("--no-render", action="store_false", dest="render", help="Disable rendering in PyBullet")
-    parser.add_argument("--demo", choices=["rrt", "cartesian_two_stage", "rrt_amiga"], default="rrt",
+    parser.add_argument("--demo", choices=["rrt", "cartesian_two_stage", "rrt_amiga", "cached_trajectory"],
+                        default="rrt",
                         help="Which demo to run (default: rrt). 'cartesian_two_stage' and "
                              "'rrt_amiga' both run on the UR5e-on-Amiga scenario, planning with "
-                             "the two-stage Cartesian planner and RRT-Connect respectively.")
+                             "the two-stage Cartesian planner and RRT-Connect respectively. "
+                             "'cached_trajectory' plays back paths saved by trajectory_cache "
+                             "(see --paths-file).")
+    parser.add_argument("--paths-file", type=str, default=None,
+                        help="cached_trajectory: reachable_paths*.npy file, or a run directory "
+                             "containing a reachable_paths_merged_*.npy.")
+    parser.add_argument("--index", type=int, default=None,
+                        help="cached_trajectory: path index to play first (more can be chosen at "
+                             "the prompt afterward).")
+    parser.add_argument("--urdf-dir", type=str, default=None,
+                        help="Amiga demos: directory holding ur5e/ur5e.urdf and amiga/visual/ "
+                             "(e.g. trajectory_cache/urdf). Defaults to this package's urdf/robots.")
+    parser.add_argument("--base-yaw-deg", type=float, default=45.0,
+                        help="cached_trajectory: robot base yaw in degrees; must match what the "
+                             "paths were generated with (default: 45).")
+    parser.add_argument("--ee-link", type=str, default="gripper_link",
+                        help="cached_trajectory: end-effector link name (default: gripper_link).")
+    parser.add_argument("--delay", type=float, default=0.01,
+                        help="cached_trajectory: seconds between configs during playback (default: 0.01).")
 
     parser.set_defaults(render=True)  # Default to True
     args = parser.parse_args()
 
-    if args.demo == "cartesian_two_stage":
+    if args.demo == "cached_trajectory":
+        if args.paths_file is None:
+            parser.error("--demo cached_trajectory requires --paths-file")
+        view_cached_trajectories(args.paths_file, urdf_dir=args.urdf_dir,
+                                 robot_base_yaw=np.deg2rad(args.base_yaw_deg), ee_link_name=args.ee_link,
+                                 index=args.index, delay=args.delay)
+        raise SystemExit
+    elif args.demo == "cartesian_two_stage":
         two_stage_cartesian_demo(renders=args.render)
         raise SystemExit
     elif args.demo == "rrt_amiga":
