@@ -542,6 +542,22 @@ class KinematicChainMotionPlanner:
         waypoints = self._approach_waypoints(start_position, start_orientation, goal_position, goal_orientation,
                                              approach_axis, approach_dist, lin_res, ang_res)
 
+        dense_path, info = self._track_waypoints(q, waypoints, collision_objects, max_joint_step,
+                                                 min_manipulability, pos_tol, ori_tol, ik_max_iter, damping)
+        if dense_path is None:
+            return None, info
+        return self.sample_path_to_length(dense_path, num_steps), info
+
+    def _track_waypoints(self, q, waypoints, collision_objects, max_joint_step, min_manipulability,
+                         pos_tol, ori_tol, ik_max_iter, damping):
+        """ Tracks (position, Rotation) waypoints with local IK seeded from the previous solve, so the
+        path stays on its starting IK branch. Fails on the checks described in approach_cartesian_path.
+
+        Returns:
+            dense_path (list[np.ndarray] or None): [q, q_1, ..., q_n], or None on failure.
+            info (dict): as in approach_cartesian_path.
+        """
+        q = np.array(q, dtype=float)
         dense_path = [q]
         min_manip = self.robot.calculate_manipulability(q)
         info = {'status': 'ok', 'min_manipulability': min_manip, 'failed_at': None}
@@ -565,7 +581,135 @@ class KinematicChainMotionPlanner:
             info.update(status=status, failed_at=k)
             return None, info
 
-        return self.sample_path_to_length(dense_path, num_steps), info
+        return dense_path, info
+
+    def refine_ik(self, q, goal_pose, pos_tol=1e-3, ori_tol=np.deg2rad(0.5), max_iter=100, damping=0.01):
+        """ Refines an approximate IK solution (e.g. from PyBullet's global IK) onto `goal_pose`
+        with local IK seeded at `q`, staying on q's IK branch.
+
+        Returns:
+            q (np.ndarray): refined configuration
+            converged (bool): whether it reached the pose within tolerance
+        """
+        q, converged, _ = self._local_ik(np.array(q, dtype=float), np.asarray(goal_pose[0], dtype=float),
+                                         R.from_quat(goal_pose[1]), pos_tol, ori_tol, max_iter, damping)
+        return q, converged
+
+    @staticmethod
+    def same_ik_branch(q_a, q_b):
+        """ True if two UR-style configurations share the elbow (sign of q[2]) and wrist
+        (sign of sin(q[4])) IK branches. """
+        return (np.sign(q_a[2]) == np.sign(q_b[2])) and (np.sign(np.sin(q_a[4])) == np.sign(np.sin(q_b[4])))
+
+    @staticmethod
+    def _resample_by_joint_arc_length(path, num_steps):
+        """ Resamples a joint path to `num_steps` configurations evenly spaced in joint-space arc length. """
+        path = np.asarray(path, dtype=float)
+        seg = np.linalg.norm(np.diff(path, axis=0), axis=1)
+        s = np.concatenate(([0.0], np.cumsum(seg)))
+        if s[-1] == 0:
+            return np.repeat(path[:1], num_steps, axis=0)
+        s_new = np.linspace(0, s[-1], num_steps)
+        return np.array([np.interp(s_new, s, path[:, j]) for j in range(path.shape[1])]).T
+
+    def hybrid_approach_path(self, start_config, goal_config, goal_pose, num_steps=100, approach_dist=0.15,
+                             min_approach_dist=0.08, approach_axis=(0, 0, 1), collision_objects=None,
+                             lin_res=0.005, transit_res=0.02, max_joint_travel=np.pi, max_joint_step=0.1,
+                             min_manipulability=0.003, pos_tol=1e-3, ori_tol=np.deg2rad(0.5), ik_max_iter=20,
+                             damping=0.01):
+        """ Plans a joint-space transit followed by a straight Cartesian approach to `goal_pose`:
+
+          1. Goal: `goal_config` is refined onto `goal_pose` (see refine_ik).
+          2. Approach: the line along the approach axis is tracked backwards from the goal with
+             local IK. If `approach_dist` fails, `min_approach_dist` is tried.
+          3. Transit: shortest-way-round joint interpolation from `start_config` to the
+             pre-approach configuration, collision-checked only (no search fallback).
+
+        Rejected if start and goal are on different elbow/wrist IK branches or any joint travels
+        more than `max_joint_travel`.
+
+        Args:
+            start_config (array-like): starting joint configuration
+            goal_config (array-like): approximate joint configuration at goal_pose (e.g. global IK)
+            goal_pose (tuple): (position, quaternion xyzw) of the end-effector at the goal
+            num_steps (int, optional): number of configurations in the returned path, evenly spaced
+                in joint-space arc length. Defaults to 100.
+            approach_dist (float, optional): length (m) of the final straight approach. Defaults to 0.15.
+            min_approach_dist (float or None, optional): fallback approach length if approach_dist fails.
+                None disables the retry. Defaults to 0.08.
+            approach_axis (array-like, optional): approach direction in the end-effector frame. Defaults to +z.
+            collision_objects (list, optional): body IDs to check against. Defaults to the robot's collision_objects.
+            lin_res (float, optional): approach tracking resolution (m). Defaults to 0.005.
+            transit_res (float, optional): max joint change (rad) between transit collision checks. Defaults to 0.02.
+            max_joint_travel (float, optional): max total change (rad) of any single joint. Defaults to pi.
+            max_joint_step, min_manipulability, pos_tol, ori_tol, ik_max_iter, damping: approach tracking
+                settings, as in approach_cartesian_path.
+
+        Returns:
+            joint_path (np.ndarray or None): (num_steps, n) joint path ending at the goal, or None on failure.
+            info (dict): 'status' ('ok', 'goal_ik_failed', 'goal_collision', 'branch_change',
+                'approach_<ik_failed|joint_jump|low_manipulability|collision>', 'joint_travel',
+                'joint_limits' or 'transit_collision'), 'approach_dist' used, and 'joint_travel'
+                (max single-joint change over the transit, rad).
+        """
+        collision_objects = collision_objects if collision_objects is not None else self.robot.collision_objects
+        start_config = np.array(start_config, dtype=float)
+        goal_position = np.asarray(goal_pose[0], dtype=float)
+        goal_rotation = R.from_quat(goal_pose[1])
+        info = {'status': 'ok', 'approach_dist': None, 'joint_travel': None}
+
+        # 1. Goal configuration
+        q_goal, converged = self.refine_ik(goal_config, goal_pose, pos_tol, ori_tol, damping=damping)
+        if not converged:
+            info['status'] = 'goal_ik_failed'
+            return None, info
+        if self.robot.in_collision(q_goal, collision_objects):
+            info['status'] = 'goal_collision'
+            return None, info
+        if not self.same_ik_branch(start_config, q_goal):
+            info['status'] = 'branch_change'
+            return None, info
+
+        # 2. Approach, tracked backwards from the goal (retreating along -approach axis)
+        a = goal_rotation.apply(np.asarray(approach_axis, dtype=float))
+        a /= np.linalg.norm(a)
+        approach = None
+        for dist in [approach_dist] + ([min_approach_dist] if min_approach_dist else []):
+            n = max(1, int(np.ceil(dist / lin_res)))
+            waypoints = [(goal_position - t * dist * a, goal_rotation) for t in np.linspace(0, 1, n + 1)[1:]]
+            approach, track_info = self._track_waypoints(q_goal, waypoints, collision_objects, max_joint_step,
+                                                         min_manipulability, pos_tol, ori_tol, ik_max_iter, damping)
+            if approach is not None:
+                info['approach_dist'] = dist
+                break
+        if approach is None:
+            info['status'] = f"approach_{track_info['status']}"
+            return None, info
+        approach = np.array(approach[::-1])  # pre-approach -> goal
+
+        # 3. Transit. Unwrap the approach so it joins the start the shortest way round
+        q_pre = approach[0]
+        approach = approach + (self.shortest_angular_distance(start_config, q_pre) - q_pre)
+        lower, upper = np.array(self.robot.lower_limits), np.array(self.robot.upper_limits)
+        if np.any(approach < lower) or np.any(approach > upper):
+            info['status'] = 'joint_limits'
+            return None, info
+
+        delta = approach[0] - start_config
+        info['joint_travel'] = float(np.max(np.abs(delta)))
+        if info['joint_travel'] > max_joint_travel:
+            info['status'] = 'joint_travel'
+            return None, info
+
+        n_transit = max(1, int(np.ceil(info['joint_travel'] / transit_res)))
+        transit = start_config + np.linspace(0, 1, n_transit + 1)[:, None] * delta
+        for q in transit[1:]:
+            if self.robot.in_collision(q, collision_objects):
+                info['status'] = 'transit_collision'
+                return None, info
+
+        path = np.vstack((transit, approach[1:]))
+        return self._resample_by_joint_arc_length(path, num_steps), info
 
     def sample_path_to_length(self, path, desired_length):
         """ Takes a joint trajectory path of any length and interpolates to a desired array length
