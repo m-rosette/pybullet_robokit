@@ -497,7 +497,11 @@ class LoadRobot:
         if jac_t is None or jac_r is None or len(jac_t) == 0 or len(jac_r) == 0:
             return np.zeros((6, len(joint_positions)))  # Return zero matrix if Jacobian is invalid
 
-        jacobian = np.vstack((jac_t, jac_r))
+        # PyBullet returns the Jacobian in the robot's base frame; rotate it into the world frame so
+        # it matches world-frame pose errors when the base is rotated (robot_base_ori != 0)
+        _, base_ori = self.con.getBasePositionAndOrientation(self.robotId)
+        base_rot = np.array(self.con.getMatrixFromQuaternion(base_ori)).reshape(3, 3)
+        jacobian = np.vstack((base_rot @ np.array(jac_t), base_rot @ np.array(jac_r)))
 
         return jacobian
     
